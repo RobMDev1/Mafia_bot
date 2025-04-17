@@ -1,2 +1,7 @@
 .qodo
 token.env
+.venv/
+*.env
+*.log
+__pycache__/
+*.pyc
