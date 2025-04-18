@@ -5,7 +5,6 @@ from aiogram import Bot, Dispatcher, types, Router
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
-TOKEN = "7556597128:AAF94Iu3tJiew4sBwWpJW_9fav2eCWPE9U8"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
