@@ -1,17 +1,20 @@
 import json
 import os
 import asyncio
+import logging
 from roles import (
     game_state, players, roles,
-    resolve_special_roles, submit_don_check,
-    submit_commissioner_check, submit_doctor_protect, submit_lawyer_hide
+    resolve_special_roles, submit_commissioner_check,
+    submit_doctor_protect, submit_lawyer_hide
 )
 from messages import announce_day, announce_night
 from strings import strings_hy as TXT
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 CONFIG_FILE = "timer_config.json"
-DEFAULT_TIMERS = {"day": 60, "night": 60, "vote": 30}
+DEFAULT_TIMERS = {"day": 60, "night": 60, "vote": 60}
+
+joined_player_ids = []
 
 def load_timers():
     if os.path.exists(CONFIG_FILE):
@@ -72,6 +75,7 @@ async def start_day_cycle(bot, chat_id):
             f"💀 {players[uid]} ասաց․ \"{msg}\"" for uid, msg in game_state["last_words"].items()
         ])
         await bot.send_message(chat_id, TXT["final_words_intro"] + "\n" + farewell)
+        logging.info("Displayed last words to group")
         game_state["last_words"].clear()
 
     alive_players = [pid for pid in game_state["alive"]]
@@ -143,8 +147,8 @@ async def conclude_vote(bot, chat_id):
     await bot.send_message(chat_id, f"✅ {players[candidate]} առաջադրվել է դուրս մնալու։ Համաձա՞յն եք։", reply_markup=confirm_kb)
     await asyncio.sleep(15)
 
-    yes_votes = len(vote_confirm_data["yes"])
-    no_votes = len(vote_confirm_data["no"])
+    yes_votes = len([uid for uid in vote_confirm_data["yes"] if uid in joined_player_ids])
+    no_votes = len([uid for uid in vote_confirm_data["no"] if uid in joined_player_ids])
 
     if yes_votes > no_votes:
         game_state["alive"].discard(candidate)
@@ -166,6 +170,7 @@ async def start_night_cycle(bot, chat_id):
 
     mafia_ids.clear()
     mafia_ids.extend([pid for pid in game_state["alive"] if roles.get(pid) in ("Mafia", "Don", "Lawyer")])
+
     targets = [pid for pid in game_state["alive"] if roles.get(pid) not in ("Mafia", "Don", "Lawyer")]
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -209,7 +214,7 @@ async def send_night_role_buttons(bot):
             await bot.send_message(pid, "💼 Ո՞ւմ եք ուզում պաշտպանել։", reply_markup=kb)
 
 async def resolve_night(bot, chat_id):
-    resolve_special_roles(bot)
+    await resolve_special_roles(bot)
     mafia_votes = game_state["night_actions"].get("mafia_votes", {})
     protected = game_state["night_actions"].get("doctor")
 
@@ -217,42 +222,42 @@ async def resolve_night(bot, chat_id):
         await bot.send_message(chat_id, TXT["night_passed"])
         return
 
+    mafia_votes = {voter: target for voter, target in mafia_votes.items() if voter in joined_player_ids}
+
     tally = {}
     for voter, target in mafia_votes.items():
         tally[target] = tally.get(target, 0) + 1
 
     max_votes = max(tally.values())
     top_targets = [pid for pid, count in tally.items() if count == max_votes]
-
     don_id = next((pid for pid in mafia_ids if roles.get(pid) == "Don"), None)
     don_vote = mafia_votes.get(don_id) if don_id else None
 
-    if len(top_targets) > 1 or don_vote not in top_targets:
-        await bot.send_message(chat_id, TXT["no_mafia_kill"])
-        return
-
-    target = don_vote
-    if target == protected:
-        await bot.send_message(chat_id, TXT["someone_survived"])
-        doctor_id = next((pid for pid in game_state["alive"] if roles.get(pid) == "Doctor"), None)
-        if doctor_id:
-            await bot.send_message(doctor_id, TXT["saved_life"].format(target=players[target]))
+    if len(top_targets) == 1 and top_targets[0] == don_vote:
+        target = top_targets[0]
+        if target == protected:
+            await bot.send_message(chat_id, TXT["someone_survived"])
+            doctor_id = next((pid for pid in game_state["alive"] if roles.get(pid) == "Doctor"), None)
+            if doctor_id:
+                await bot.send_message(doctor_id, TXT["saved_life"].format(target=players[target]))
+        else:
+            game_state["alive"].discard(target)
+            game_state["awaiting_last_words"].add(target)
+            logging.info(f"{players[target]} marked for last words")
+            await bot.send_message(target, TXT["you_were_eliminated"])
+            await bot.send_message(chat_id, TXT["announced_death"].format(name=players[target], role=roles[target]))
     else:
-        game_state["alive"].discard(target)
-        game_state["awaiting_last_words"].add(target)
-        await bot.send_message(target, TXT["you_were_eliminated"])
-        await bot.send_message(chat_id, TXT["announced_death"].format(name=players[target], role=roles[target]))
+        await bot.send_message(chat_id, TXT["no_mafia_kill"])
 
     game_state["night_actions"] = {
         "mafia_votes": {},
         "doctor": None,
         "lawyer": None,
-        "don_check": None,
         "commissioner_check": None
     }
-
     await bot.send_message(chat_id, TXT["new_day"])
     await check_win_conditions(bot, chat_id)
+
 
 async def force_day(bot, chat_id):
     await start_day_cycle(bot, chat_id)
@@ -271,12 +276,20 @@ def set_phase_timer(phase: str, seconds: int):
     return False
 
 def register_vote(voter_id: int, target_id: int):
-    if voter_id in game_state["alive"] and target_id in game_state["alive"]:
-        vote_data[voter_id] = target_id
+    if current_phase != "vote":
+        return
+    if voter_id not in joined_player_ids or voter_id not in game_state["alive"] or target_id not in game_state["alive"]:
+        return
+    vote_data[voter_id] = target_id
+
 
 def register_mafia_vote(voter_id: int, target_id: int):
-    if voter_id in game_state["alive"] and target_id in game_state["alive"]:
-        game_state["night_actions"]["mafia_votes"][voter_id] = target_id
+    if current_phase != "night":
+        return
+    if voter_id not in joined_player_ids or voter_id not in game_state["alive"] or target_id not in game_state["alive"]:
+        return
+    game_state["night_actions"]["mafia_votes"][voter_id] = target_id
+
 
 async def check_win_conditions(bot, chat_id):
     mafia_roles = {"Mafia", "Don", "Lawyer"}
@@ -286,9 +299,11 @@ async def check_win_conditions(bot, chat_id):
     if mafia_count == 0:
         await bot.send_message(chat_id, TXT["game_over_citizens"])
         await lift_all_restrictions(bot, chat_id)
+        joined_player_ids.clear()
         return True
     elif mafia_count >= others_count:
         await bot.send_message(chat_id, TXT["game_over_mafia"])
         await lift_all_restrictions(bot, chat_id)
+        joined_player_ids.clear()
         return True
     return False

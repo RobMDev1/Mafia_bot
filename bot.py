@@ -1,6 +1,7 @@
 import asyncio
 import random
 import os
+import logging
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, types
 from aiogram.filters import Command
@@ -10,19 +11,22 @@ from roles import handle_night_action, game_state, players, player_order, roles
 from phases import (
     start_day_cycle, set_phase_timer, register_vote,
     register_mafia_vote, force_day, force_night, force_vote,
-    mafia_ids, vote_data, vote_confirm_data
+    mafia_ids, vote_data, vote_confirm_data, joined_player_ids,
+    phase_timers
 )
 from strings import strings_hy as TXT
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 load_dotenv("token.env")
 TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=TOKEN)
 BOT_USERNAME = "secretcartel_bot"
 dp = Dispatcher()
 router = Router()
-
 group_id = None
 join_message_id = None
-
 
 async def is_admin(message: Message) -> bool:
     member = await bot.get_chat_member(message.chat.id, message.from_user.id)
@@ -54,7 +58,6 @@ async def start_game(message: Message):
     msg = await message.answer(TXT["join_game_prompt"], reply_markup=keyboard)
     join_message_id = msg.message_id
 
-
 @router.callback_query(lambda c: c.data == "join_game")
 async def join_game_callback(callback: CallbackQuery):
     user = callback.from_user
@@ -62,7 +65,7 @@ async def join_game_callback(callback: CallbackQuery):
     try:
         await bot.send_message(user.id, TXT["dm_join_confirmation"])
     except Exception as e:
-        print(f"❌ Failed to DM user {user.id}: {e}")
+        logging.error(f"Failed to DM user {user.id}: {e}")
         await callback.answer("Խնդրում ենք նախ գրել բոթին։", show_alert=True)
         return
 
@@ -73,7 +76,9 @@ async def join_game_callback(callback: CallbackQuery):
     else:
         await callback.answer(TXT["already_joined"], show_alert=True)
 
-    # Update group message
+    if user.id not in joined_player_ids:
+        joined_player_ids.append(user.id)
+
     if group_id and join_message_id:
         try:
             text = TXT["players_joined"] + "\n" + "\n".join(
@@ -89,8 +94,7 @@ async def join_game_callback(callback: CallbackQuery):
                 reply_markup=keyboard.as_markup()
             )
         except Exception as e:
-            print(f"❌ Failed to update join message: {e}")
-
+            logging.error(f"Failed to update join message: {e}")
 
 @router.message(Command("startplaying"))
 async def start_playing(message: Message):
@@ -107,17 +111,28 @@ async def start_playing(message: Message):
     game_state["alive"] = set(player_order)
 
     num_players = len(player_order)
-    num_mafia = max(1, num_players // 4)
-    role_pool = ["Don"] + ["Mafia"] * (num_mafia - 1) + ["Commissioner"]
+    roles_list = []
 
-    if num_players > 7:
-        role_pool.append("Doctor")
-        role_pool.append("Lawyer")
+    mafia_count = max(1, num_players // 3)
 
-    role_pool += ["Citizen"] * (num_players - len(role_pool))
-    random.shuffle(role_pool)
+    if num_players >= 8:
+        roles_list.append("Don")
+        mafia_count -= 1
+    if num_players >= 9:
+        roles_list.append("Lawyer")
+        mafia_count -= 1
 
-    print("Assigning roles to players:", [(players[pid], role) for pid, role in zip(player_order, role_pool)])
+    roles_list += ["Mafia"] * mafia_count
+    roles_list.append("Commissioner")
+    if num_players >= 6:
+        roles_list.append("Doctor")
+
+    remaining = num_players - len(roles_list)
+    roles_list += ["Citizen"] * remaining
+    random.shuffle(roles_list)
+
+    for pid, role in zip(player_order, roles_list):
+        roles[pid] = role
 
     armenian_roles = {
         "Mafia": "Մաֆիա",
@@ -128,14 +143,11 @@ async def start_playing(message: Message):
         "Citizen": "Քաղաքացի"
     }
 
-    for pid, role in zip(player_order, role_pool):
-        roles[pid] = role
-
     for pid in player_order:
         role = roles[pid]
         try:
             role_arm = armenian_roles.get(role, role)
-            message_text = f"{TXT['your_role']} {role_arm}"
+            msg = f"{TXT['your_role']} {role_arm}"
             if role in ["Mafia", "Don", "Lawyer"]:
                 teammates = [
                     (players[uid], armenian_roles[roles[uid]])
@@ -143,12 +155,10 @@ async def start_playing(message: Message):
                     if uid != pid and roles[uid] in ["Mafia", "Don", "Lawyer"]
                 ]
                 if teammates:
-                    teammate_info = "\n".join(f"• {name} ({r})" for name, r in teammates)
-                    message_text += f"\n{TXT['mafia_teammates']}\n{teammate_info}"
-            await bot.send_message(pid, message_text)
-            print(f"✅ Sent role to {players[pid]} ({pid})")
+                    msg += f"\n{TXT['mafia_teammates']}\n" + "\n".join(f"• {n} ({r})" for n, r in teammates)
+            await bot.send_message(pid, msg)
         except Exception as e:
-            print(f"❌ Could not send role to {players[pid]} ({pid}): {e}")
+            logging.error(f"❌ Could not DM {players[pid]}: {e}")
 
     await message.answer(TXT["roles_assigned"])
     await force_night(bot, group_id)
@@ -186,6 +196,19 @@ async def set_timer(message: Message):
         await message.answer(TXT["set_timer_success"].format(phase=phase, seconds=time_str))
     else:
         await message.answer(TXT["unknown_phase"])
+
+@router.message(Command("showtimer"))
+async def show_timer(message: Message):
+    if not await is_admin(message):
+        await message.reply(TXT["only_admin"])
+        return
+    msg = (
+        f"⏱️ Այս պահին սահմանված են փուլերի ժամանակները՝\n"
+        f"- 🌞 Օր՝ {phase_timers['day']} վայրկյան\n"
+        f"- 🌙 Գիշեր՝ {phase_timers['night']} վայրկյան\n"
+        f"- 🗳️ Քվեարկություն՝ {phase_timers['vote']} վայրկյան"
+    )
+    await message.answer(msg)
 
 @router.message(Command("forceday"))
 async def admin_force_day(message: Message):
@@ -228,9 +251,8 @@ async def stop_game(message: Message):
         "commissioner_check": None
     }
 
-    global mafia_ids, current_phase, vote_data, vote_confirm_data
+    global mafia_ids, vote_data, vote_confirm_data
     mafia_ids = []
-    current_phase = None
     vote_data.clear()
     vote_confirm_data = {
         "candidate": None,
@@ -240,40 +262,64 @@ async def stop_game(message: Message):
 
     await message.answer("🛑 Խաղը դադարեցվել է։")
 
+@router.callback_query(lambda c: c.data.startswith("vote_"))
+async def vote_callback(callback_query: CallbackQuery):
+    voter = callback_query.from_user.id
+    target = int(callback_query.data.split("_")[1])
+    before = len(vote_data)
+    register_vote(voter, target)
+    after = len(vote_data)
+
+    if after > before:
+        voter_name = players.get(voter, "Unknown")
+        target_name = players.get(target, "Unknown")
+        await bot.send_message(callback_query.message.chat.id, f"🗳 {voter_name} քվեարկեց {target_name}-ի օգտին։")
+        logging.info(f"{voter_name} voted for {target_name}")
+        await callback_query.answer(TXT["vote_registered"])
+    else:
+        await callback_query.answer("❌ Դուք չեք կարող քվեարկել։", show_alert=True)
+
+@router.callback_query(lambda c: c.data.startswith("mafkill_"))
+async def mafia_vote_callback(callback_query: CallbackQuery):
+    voter = callback_query.from_user.id
+    target = int(callback_query.data.split("_")[1])
+    before = len(game_state["night_actions"]["mafia_votes"])
+    register_mafia_vote(voter, target)
+    after = len(game_state["night_actions"]["mafia_votes"])
+
+    if after > before:
+        voter_name = players.get(voter, "Unknown")
+        target_name = players.get(target, "Unknown")
+        logging.info(f"{voter_name} (Mafia) voted to kill {target_name}")
+        for pid in mafia_ids:
+            if pid != voter and roles.get(pid) in ("Mafia", "Don", "Lawyer") and pid in game_state["alive"]:
+                try:
+                    await bot.send_message(pid, f"🔫 {voter_name} քվեարկեց {target_name}-ի սպանությանը։")
+                except Exception as e:
+                    logging.error(f"Failed to relay mafia vote to {pid}: {e}")
+        await callback_query.answer(TXT["mafia_vote_registered"])
+    else:
+        await callback_query.answer("❌ Դուք չեք կարող քվեարկել։", show_alert=True)
 
 @router.message()
 async def relay_mafia_message(message: Message):
     if (
         message.chat.type == "private"
         and message.from_user.id in mafia_ids
-        and message.from_user.id in game_state["alive"]  # ✅ Alive check
+        and message.from_user.id in game_state["alive"]
     ):
         sender_name = players.get(message.from_user.id, "Unknown")
-        for pid in players:
-            if roles.get(pid) in ("Mafia", "Don", "Lawyer") and pid != message.from_user.id:
+        logging.info(f"[Mafia Chat] {sender_name}: {message.text}")
+        for pid in mafia_ids:
+            if pid != message.from_user.id and roles.get(pid) in ("Mafia", "Don", "Lawyer") and pid in game_state["alive"]:
                 try:
                     await bot.send_message(pid, f"🕵️ {sender_name}: {message.text}")
                 except Exception as e:
-                    print(f"❌ Failed to relay mafia chat to {pid}: {e}")
-
+                    logging.error(f"Failed to relay mafia chat to {pid}: {e}")
 
 @router.callback_query(lambda c: c.data.startswith(("doncheck_", "commcheck_", "lawyerhide_", "docprotect_")))
 async def night_action_router(callback_query: CallbackQuery):
     await handle_night_action(callback_query, bot)
-
-@router.callback_query(lambda c: c.data.startswith("vote_"))
-async def vote_callback(callback_query: CallbackQuery):
-    voter = callback_query.from_user.id
-    target = int(callback_query.data.split("_")[1])
-    register_vote(voter, target)
-    await callback_query.answer(TXT["vote_registered"])
-
-@router.callback_query(lambda c: c.data.startswith("mafkill_"))
-async def mafia_vote_callback(callback_query: CallbackQuery):
-    voter = callback_query.from_user.id
-    target = int(callback_query.data.split("_")[1])
-    register_mafia_vote(voter, target)
-    await callback_query.answer(TXT["mafia_vote_registered"])
 
 @router.message()
 async def handle_last_words(message: Message):
@@ -281,11 +327,14 @@ async def handle_last_words(message: Message):
     if uid in game_state["awaiting_last_words"]:
         game_state["last_words"][uid] = message.text
         game_state["awaiting_last_words"].discard(uid)
-        await message.answer(TXT["last_words_saved"])
+        logging.info(f"Saved last words from {players.get(uid, uid)}: {message.text}")
+        try:
+            await message.answer(TXT["last_words_saved"])
+        except Exception as e:
+            logging.error(f"Failed to send last word confirmation to {uid}: {e}")
 
 async def main():
     dp.include_router(router)
-
     commands = [
         BotCommand(command="startgame", description="Start a new game (admin only)"),
         BotCommand(command="startplaying", description="Assign roles & begin (admin only)"),
@@ -295,11 +344,11 @@ async def main():
         BotCommand(command="forceday", description="Force day phase"),
         BotCommand(command="forcenight", description="Force night phase"),
         BotCommand(command="forcevote", description="Force vote phase"),
-        BotCommand(command="help", description="Show help message")
+        BotCommand(command="showtimer", description="Show timers"),
+        BotCommand(command="help", description="Show help message"),
     ]
     await bot.set_my_commands(commands)
-
-    print("🤖 Bot is running and polling...")
+    logging.info("Bot is running and polling...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
